@@ -38,8 +38,15 @@ GENERAL_LABELS = [
     "help wanted",
 ]
 
+# Fast lookup set for tier inference — derived from BEGINNER_LABELS, not hand-maintained
+BEGINNER_LABELS_SET = {l.lower() for l in BEGINNER_LABELS}
+
 # Only surface issues created within this window (reduces stale results)
 RECENCY_DAYS = 90
+
+# Hard cap on search API calls per run — safety net, should never be reached
+# with the OR-query architecture (one call per language = len(LANGUAGES) calls)
+MAX_SEARCH_CALLS = len(LANGUAGES) + 2
 
 # Repo quality floor
 MIN_STARS = 200
@@ -58,36 +65,71 @@ GITHUB_HEADERS = {
 
 # ─── GitHub API ───────────────────────────────────────────────────────────────
 
-def search_issues(language: str, label: str, since_date: str) -> list[dict]:
+def search_issues_for_language(language: str, since_date: str) -> list[dict]:
     """
-    Search GitHub for open, unassigned issues matching a language + label,
-    created within the recency window.
-    Returns up to 30 results, sorted by newest first.
+    ONE query per language with all labels OR'd together.
 
-    since_date: ISO date string e.g. "2024-12-21"
+    Previous architecture: (4 languages × 7 labels) = 28 search calls
+    This architecture:      4 languages × 1 query    =  4 search calls
+
+    Label tier is NOT encoded in the query — it is inferred from each
+    returned issue's actual labels against BEGINNER_LABELS_SET at score time.
+    This means a single query recovers both beginner and general issues,
+    and the scorer weights them correctly without the API overhead.
+
+    Retry policy: respects the Retry-After header GitHub sends on 403,
+    falling back to hardcoded waits if the header is absent.
     """
+    beginner_clause = " OR ".join(f'label:"{l}"' for l in BEGINNER_LABELS)
+    general_clause  = " OR ".join(f'label:"{l}"' for l in GENERAL_LABELS)
+    label_filter    = f'({beginner_clause} OR {general_clause})'
+
     query = (
-        f'label:"{label}" language:{language} '
-        f'state:open is:issue no:assignee '
-        f'created:>{since_date}'
+        f'language:{language} state:open is:issue no:assignee '
+        f'created:>{since_date} {label_filter}'
     )
-    resp = requests.get(
-        "https://api.github.com/search/issues",
-        headers=GITHUB_HEADERS,
-        params={"q": query, "sort": "created", "order": "desc", "per_page": 30},
-    )
+    params = {"q": query, "sort": "created", "order": "desc", "per_page": 50}
+
+    retry_waits = [15, 30]  # fallback if Retry-After header is absent
+
+    for attempt, fallback_wait in enumerate(retry_waits + [None], start=1):
+        resp = requests.get(
+            "https://api.github.com/search/issues",
+            headers=GITHUB_HEADERS,
+            params=params,
+        )
+        if resp.status_code == 403 and fallback_wait is not None:
+            # Respect GitHub's own backoff instruction if present
+            wait = int(resp.headers.get("Retry-After", fallback_wait))
+            print(f"    ↻ 403 on attempt {attempt}, sleeping {wait}s "
+                  f"(Retry-After: {resp.headers.get('Retry-After', 'n/a')})...", flush=True)
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        return resp.json().get("items", [])
+
     resp.raise_for_status()
-    return resp.json().get("items", [])
+    return []
 
 
-def get_repo(full_name: str) -> dict:
-    """Fetch repo metadata (stars, archived status, language)."""
+def get_repo(full_name: str, cache: dict) -> dict:
+    """
+    Fetch repo metadata (stars, archived status, language).
+
+    cache is a dict passed in by the caller and mutated here — many issues
+    come from the same repo, so without caching we'd make duplicate API calls
+    for every issue in a popular repo (e.g. 10 issues from microsoft/vscode
+    previously triggered 10 identical get_repo calls).
+    """
+    if full_name in cache:
+        return cache[full_name]
     resp = requests.get(
         f"https://api.github.com/repos/{full_name}",
         headers=GITHUB_HEADERS,
     )
     resp.raise_for_status()
-    return resp.json()
+    cache[full_name] = resp.json()
+    return cache[full_name]
 
 
 # ─── Scoring ─────────────────────────────────────────────────────────────────
@@ -209,40 +251,43 @@ def score_issue(issue: dict, repo: dict, label_tier: str) -> int:
 
 def collect_issues() -> list[dict]:
     """
-    Search across all languages × label tiers, deduplicate, score,
-    and return the top N candidates.
+    Search across all languages, deduplicate, score, and return top N.
 
-    Label tiers are searched separately so the scorer can treat them
-    differently — beginner labels are boosted, general labels penalized.
+    Architecture change: one OR-combined query per language (4 total) instead
+    of one query per language × label combination (28 total). This keeps the
+    run well under GitHub's secondary rate limit threshold.
+
+    Tier is inferred from each issue's actual labels rather than encoded in
+    the search query, so scoring accuracy is preserved.
     """
     seen       = set()
+    repo_cache: dict = {}   # repo_full → repo dict; avoids duplicate API calls
     candidates = []
+    search_calls = 0
 
-    # Recency cutoff — calculated fresh each run
     since_date = (
         datetime.now(timezone.utc) - timedelta(days=RECENCY_DAYS)
     ).strftime("%Y-%m-%d")
-    print(f"  Recency filter: issues created after {since_date}")
+    print(f"  Recency filter: issues created after {since_date}", flush=True)
+    print(f"  Search calls planned: {len(LANGUAGES)} (one per language, labels OR'd)", flush=True)
 
-    # Build the full search plan: (language, label, tier_name)
-    search_plan = (
-        [(lang, label, "beginner") for lang in LANGUAGES for label in BEGINNER_LABELS]
-        + [(lang, label, "general") for lang in LANGUAGES for label in GENERAL_LABELS]
-    )
+    for lang in LANGUAGES:
+        if search_calls >= MAX_SEARCH_CALLS:
+            print(f"  ⚠ Search budget ({MAX_SEARCH_CALLS}) reached, stopping early.", flush=True)
+            break
 
-    for lang, label, tier in search_plan:
-        # Sleep BEFORE every request — unconditional.
-        # Previously the sleep lived inside search_issues after raise_for_status(),
-        # meaning a 403 skipped the delay entirely and the next request fired
-        # instantly, triggering GitHub's secondary rate limiter in a cascade.
-        # 2.1s keeps us well under 30 req/min (28 calls × 2.1s = ~59s total).
-        time.sleep(2.1)
-        print(f"  Searching [{tier}]: language={lang}, label='{label}'")
+        # 3s between language queries — 4 calls × 3s = 12s total, well within limits
+        time.sleep(3)
+        print(f"  Searching: language={lang} (all labels combined)", flush=True)
+        search_calls += 1
+
         try:
-            items = search_issues(lang, label, since_date)
+            items = search_issues_for_language(lang, since_date)
         except requests.HTTPError as e:
-            print(f"  ⚠ Search failed ({e}), skipping.")
+            print(f"  ⚠ Search failed ({e}), skipping {lang}.", flush=True)
             continue
+
+        print(f"    → {len(items)} raw results", flush=True)
 
         for issue in items:
             issue_id = issue["id"]
@@ -250,20 +295,25 @@ def collect_issues() -> list[dict]:
                 continue
             seen.add(issue_id)
 
-            # Extract repo path from the API URL
             repo_full = issue["repository_url"].split("repos/")[-1]
 
             try:
-                repo = get_repo(repo_full)
-                time.sleep(0.4)
+                is_cache_miss = repo_full not in repo_cache
+                repo = get_repo(repo_full, repo_cache)
+                if is_cache_miss:
+                    time.sleep(0.4)  # only throttle actual API calls, not cache hits
             except requests.HTTPError:
                 continue
 
-            # Skip archived or low-star repos
             if repo.get("archived"):
                 continue
             if repo.get("stargazers_count", 0) < MIN_STARS:
                 continue
+
+            # Infer tier from the issue's actual labels — if any beginner label
+            # is present, it scores as beginner; otherwise general (help wanted)
+            issue_label_set = {l["name"].lower() for l in issue.get("labels", [])}
+            tier = "beginner" if issue_label_set & BEGINNER_LABELS_SET else "general"
 
             s = score_issue(issue, repo, tier)
             candidates.append({
@@ -280,6 +330,7 @@ def collect_issues() -> list[dict]:
                 "created_at":   issue["created_at"],
             })
 
+    print(f"  Repo cache hits saved {sum(1 for _ in repo_cache)} duplicate API calls.", flush=True)
     candidates.sort(key=lambda x: x["score"], reverse=True)
     return candidates[:TOP_N]
 
@@ -366,21 +417,21 @@ def send_email(html: str) -> None:
         },
     )
     resp.raise_for_status()
-    print(f"✓ Email sent → {resp.json().get('id')}")
+    print(f"✓ Email sent → {resp.json().get('id')}", flush=True)
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("── OSS Issue Finder ──────────────────────────")
-    print("Searching GitHub for issues...")
+    print("── OSS Issue Finder ──────────────────────────", flush=True)
+    print("Searching GitHub for issues...", flush=True)
     issues = collect_issues()
-    print(f"Shortlisted {len(issues)} issues.")
+    print(f"Shortlisted {len(issues)} issues.", flush=True)
 
     if not issues:
-        print("No issues found — nothing to send.")
+        print("No issues found — nothing to send.", flush=True)
     else:
         html = build_html(issues)
-        print("Sending digest email...")
+        print("Sending digest email...", flush=True)
         send_email(html)
-        print("Done.")
+        print("Done.", flush=True)
