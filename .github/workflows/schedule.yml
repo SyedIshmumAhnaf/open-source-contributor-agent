@@ -1,0 +1,35 @@
+name: Weekly OSS Issue Finder
+
+on:
+  schedule:
+    # Thursday 10pm BDT = Thursday 4pm UTC  (BDT is UTC+6)
+    - cron: '0 16 * * 4'
+
+  # Lets you trigger a run manually from the Actions tab at any time
+  workflow_dispatch:
+
+jobs:
+  find-issues:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run finder
+        env:
+          # GITHUB_TOKEN is automatically provided by Actions — no setup needed.
+          # RESEND_API_KEY and TO_EMAIL must be added as repository secrets.
+          # Go to: Settings → Secrets and variables → Actions → New repository secret
+          GITHUB_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          TO_EMAIL:       ${{ secrets.TO_EMAIL }}
+        run: python finder.py

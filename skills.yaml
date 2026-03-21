@@ -1,0 +1,42 @@
+# skills.yaml
+# ─────────────────────────────────────────────────────
+# Your personal knowledge base for the OSS Issue Finder.
+#
+# This file is the foundation for Phase 2 — once the
+# skill matcher is built, finder.py will read this file
+# and use it to weight issues toward your actual stack.
+#
+# Comfort levels: beginner | intermediate | advanced
+# ─────────────────────────────────────────────────────
+
+languages:
+  python:     advanced
+  java:       intermediate
+  javascript: intermediate
+  typescript: beginner
+
+frameworks:
+  flask:    intermediate
+
+databases:
+  postgresql: beginner
+  mysql:      intermediate
+  sqlite:     beginner
+
+domains:
+  - scripting
+  - automation
+  - web-backend
+  - cli-tools
+  - testing
+
+avoid:
+  # Domains to deprioritize — finder will score these lower in Phase 2
+  - embedded-systems
+  - mobile
+  - devops-infrastructure
+
+# Target effort range (hours) for a single weekend session
+target_hours:
+  min: 4
+  max: 8
