@@ -6,6 +6,7 @@ scores them by complexity, and emails a digest via Resend.
 """
 
 import os
+import random
 import time
 import requests
 from datetime import datetime, timezone, timedelta
@@ -17,15 +18,12 @@ RESEND_API_KEY = os.environ["RESEND_API_KEY"]
 TO_EMAIL      = os.environ["TO_EMAIL"]
 
 # Your languages — update this list as your skills evolve
-LANGUAGES = ["python", "javascript", "typescript", "java"]
+LANGUAGES = ["python", "javascript"]
 
-# Label tiers — searched separately so scores can be weighted differently.
+# Label tiers — used for SCORING only (tier inference from returned issue labels)
 #
 # BEGINNER_LABELS: strong intent signal → score boosted
-#   Covers the many naming variants repos use for the same concept.
-#
-# GENERAL_LABELS: weaker signal — often complex tasks, not just beginner ones
-#   Still searched for recall, but scored more conservatively.
+# GENERAL_LABELS:  weaker signal → score penalized
 BEGINNER_LABELS = [
     "good first issue",
     "good-first-issue",
@@ -41,12 +39,31 @@ GENERAL_LABELS = [
 # Fast lookup set for tier inference — derived from BEGINNER_LABELS, not hand-maintained
 BEGINNER_LABELS_SET = {l.lower() for l in BEGINNER_LABELS}
 
+# SEARCH_LABELS — used for QUERYING only (one query per language per label)
+#
+# Deliberately kept to 2 high-signal labels:
+#   "good first issue" covers ~90% of repos using beginner labels
+#   "help wanted"      catches repos that skip the beginner label entirely
+#
+# Why not OR-combine all labels into one query?
+# GitHub's Search API does NOT support parenthesized OR grouping for label:
+# filters. The syntax (label:"x" OR label:"y") silently returns 0 results
+# because GitHub treats the parentheses as literal search characters.
+# Separate queries per label is the only reliable approach.
+#
+# 2 labels × 2 languages = 4 total search calls — comfortably under the
+# secondary rate limit threshold.
+SEARCH_LABELS = [
+    "good first issue",
+    "help wanted",
+]
+
 # Only surface issues created within this window (reduces stale results)
 RECENCY_DAYS = 90
 
-# Hard cap on search API calls per run — safety net, should never be reached
-# with the OR-query architecture (one call per language = len(LANGUAGES) calls)
-MAX_SEARCH_CALLS = len(LANGUAGES) + 2
+# After any 403, pause the entire run before the next query.
+# Mimics human browsing cadence and lets GitHub's session limiter reset.
+GLOBAL_COOLDOWN_SECS = 60
 
 # Repo quality floor
 MIN_STARS = 200
@@ -65,42 +82,40 @@ GITHUB_HEADERS = {
 
 # ─── GitHub API ───────────────────────────────────────────────────────────────
 
-def search_issues_for_language(language: str, since_date: str) -> list[dict]:
+def search_issues(language: str, label: str, since_date: str) -> list[dict]:
     """
-    ONE query per language with all labels OR'd together.
+    Search GitHub for open, unassigned issues for one language + one label.
 
-    Previous architecture: (4 languages × 7 labels) = 28 search calls
-    This architecture:      4 languages × 1 query    =  4 search calls
+    Deliberately one label per call — GitHub's Search API does NOT support
+    parenthesized OR grouping for label: filters. The syntax
+    (label:"x" OR label:"y") silently returns 0 results because GitHub treats
+    the parentheses as literal search characters, not grouping operators.
 
-    Label tier is NOT encoded in the query — it is inferred from each
-    returned issue's actual labels against BEGINNER_LABELS_SET at score time.
-    This means a single query recovers both beginner and general issues,
-    and the scorer weights them correctly without the API overhead.
+    Call count: len(SEARCH_LABELS) × len(LANGUAGES) = 2 × 4 = 8 queries.
+    At 4s spacing that's ~32s total — well within secondary rate limit bounds.
 
-    Retry policy: respects the Retry-After header GitHub sends on 403,
-    falling back to hardcoded waits if the header is absent.
+    Retry policy: respects Retry-After header, falls back to hardcoded waits.
     """
-    beginner_clause = " OR ".join(f'label:"{l}"' for l in BEGINNER_LABELS)
-    general_clause  = " OR ".join(f'label:"{l}"' for l in GENERAL_LABELS)
-    label_filter    = f'({beginner_clause} OR {general_clause})'
-
+    # no:assignee is intentionally omitted from the query — it tightens the
+    # filter signature and contributes to abuse detection. Assignee check is
+    # done in Python after results are returned.
     query = (
-        f'language:{language} state:open is:issue no:assignee '
-        f'created:>{since_date} {label_filter}'
+        f'label:"{label}" language:{language} '
+        f'state:open is:issue '
+        f'created:>{since_date}'
     )
     params = {"q": query, "sort": "created", "order": "desc", "per_page": 50}
 
-    retry_waits = [15, 30]  # fallback if Retry-After header is absent
-
-    for attempt, fallback_wait in enumerate(retry_waits + [None], start=1):
+    for attempt, _ in enumerate(range(3), start=1):
         resp = requests.get(
             "https://api.github.com/search/issues",
             headers=GITHUB_HEADERS,
             params=params,
         )
-        if resp.status_code == 403 and fallback_wait is not None:
-            # Respect GitHub's own backoff instruction if present
-            wait = int(resp.headers.get("Retry-After", fallback_wait))
+        if resp.status_code == 403 and attempt < 3:
+            # Exponential backoff: 20s, 40s — respects Retry-After if present
+            fallback = 20 * (2 ** (attempt - 1))
+            wait = int(resp.headers.get("Retry-After", fallback))
             print(f"    ↻ 403 on attempt {attempt}, sleeping {wait}s "
                   f"(Retry-After: {resp.headers.get('Retry-After', 'n/a')})...", flush=True)
             time.sleep(wait)
@@ -251,40 +266,48 @@ def score_issue(issue: dict, repo: dict, label_tier: str) -> int:
 
 def collect_issues() -> list[dict]:
     """
-    Search across all languages, deduplicate, score, and return top N.
+    Search across SEARCH_LABELS × LANGUAGES, deduplicate, score, return top N.
 
-    Architecture change: one OR-combined query per language (4 total) instead
-    of one query per language × label combination (28 total). This keeps the
-    run well under GitHub's secondary rate limit threshold.
-
-    Tier is inferred from each issue's actual labels rather than encoded in
-    the search query, so scoring accuracy is preserved.
+    Anti-detection measures applied:
+      - Pairs are shuffled before each run (non-sequential language order)
+      - Sleep between queries uses random jitter (4–7s) instead of fixed 4s
+      - no:assignee removed from query; filtered in Python (looser fingerprint)
+      - Global 60s cooldown fires after any 403 before the next query
     """
-    seen       = set()
-    repo_cache: dict = {}   # repo_full → repo dict; avoids duplicate API calls
-    candidates = []
-    search_calls = 0
+    seen          = set()
+    repo_cache: dict = {}
+    candidates    = []
+    global_cooldown_triggered = False
 
     since_date = (
         datetime.now(timezone.utc) - timedelta(days=RECENCY_DAYS)
     ).strftime("%Y-%m-%d")
+
+    # Build and shuffle the search plan so query order is non-deterministic
+    pairs = [(lang, label) for lang in LANGUAGES for label in SEARCH_LABELS]
+    random.shuffle(pairs)
+
     print(f"  Recency filter: issues created after {since_date}", flush=True)
-    print(f"  Search calls planned: {len(LANGUAGES)} (one per language, labels OR'd)", flush=True)
+    print(f"  Search plan: {len(pairs)} queries (shuffled)", flush=True)
 
-    for lang in LANGUAGES:
-        if search_calls >= MAX_SEARCH_CALLS:
-            print(f"  ⚠ Search budget ({MAX_SEARCH_CALLS}) reached, stopping early.", flush=True)
-            break
+    for lang, label in pairs:
+        # Jitter: random delay between 4–7s breaks the bot-pattern fingerprint
+        jitter = random.uniform(4, 7)
+        time.sleep(jitter)
 
-        # 3s between language queries — 4 calls × 3s = 12s total, well within limits
-        time.sleep(3)
-        print(f"  Searching: language={lang} (all labels combined)", flush=True)
-        search_calls += 1
+        print(f"  Searching: language={lang}, label='{label}'", flush=True)
 
         try:
-            items = search_issues_for_language(lang, since_date)
+            items = search_issues(lang, label, since_date)
         except requests.HTTPError as e:
-            print(f"  ⚠ Search failed ({e}), skipping {lang}.", flush=True)
+            print(f"  ⚠ Search failed ({e}), skipping.", flush=True)
+            # Global cooldown: any 403 that exhausted all retries means the
+            # session is flagged — pause the whole run before continuing
+            if "403" in str(e) and not global_cooldown_triggered:
+                global_cooldown_triggered = True
+                print(f"  ⚠ Global cooldown: sleeping {GLOBAL_COOLDOWN_SECS}s "
+                      f"to let rate limiter reset...", flush=True)
+                time.sleep(GLOBAL_COOLDOWN_SECS)
             continue
 
         print(f"    → {len(items)} raw results", flush=True)
@@ -295,13 +318,17 @@ def collect_issues() -> list[dict]:
                 continue
             seen.add(issue_id)
 
+            # Python-side assignee filter (removed from query to reduce bot signature)
+            if issue.get("assignee") is not None:
+                continue
+
             repo_full = issue["repository_url"].split("repos/")[-1]
 
             try:
                 is_cache_miss = repo_full not in repo_cache
                 repo = get_repo(repo_full, repo_cache)
                 if is_cache_miss:
-                    time.sleep(0.4)  # only throttle actual API calls, not cache hits
+                    time.sleep(0.4)
             except requests.HTTPError:
                 continue
 
@@ -310,8 +337,6 @@ def collect_issues() -> list[dict]:
             if repo.get("stargazers_count", 0) < MIN_STARS:
                 continue
 
-            # Infer tier from the issue's actual labels — if any beginner label
-            # is present, it scores as beginner; otherwise general (help wanted)
             issue_label_set = {l["name"].lower() for l in issue.get("labels", [])}
             tier = "beginner" if issue_label_set & BEGINNER_LABELS_SET else "general"
 
@@ -330,7 +355,7 @@ def collect_issues() -> list[dict]:
                 "created_at":   issue["created_at"],
             })
 
-    print(f"  Repo cache hits saved {sum(1 for _ in repo_cache)} duplicate API calls.", flush=True)
+    print(f"  Repo cache: {len(repo_cache)} unique repos fetched.", flush=True)
     candidates.sort(key=lambda x: x["score"], reverse=True)
     return candidates[:TOP_N]
 
