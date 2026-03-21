@@ -77,7 +77,6 @@ def search_issues(language: str, label: str, since_date: str) -> list[dict]:
         params={"q": query, "sort": "created", "order": "desc", "per_page": 30},
     )
     resp.raise_for_status()
-    time.sleep(2)  # GitHub search rate limit: 30 req/min — stay safe
     return resp.json().get("items", [])
 
 
@@ -232,6 +231,12 @@ def collect_issues() -> list[dict]:
     )
 
     for lang, label, tier in search_plan:
+        # Sleep BEFORE every request — unconditional.
+        # Previously the sleep lived inside search_issues after raise_for_status(),
+        # meaning a 403 skipped the delay entirely and the next request fired
+        # instantly, triggering GitHub's secondary rate limiter in a cascade.
+        # 2.1s keeps us well under 30 req/min (28 calls × 2.1s = ~59s total).
+        time.sleep(2.1)
         print(f"  Searching [{tier}]: language={lang}, label='{label}'")
         try:
             items = search_issues(lang, label, since_date)
