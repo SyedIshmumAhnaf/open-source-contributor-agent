@@ -14,10 +14,10 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.4.0
         with:
           python-version: '3.12'
 
@@ -26,10 +26,8 @@ jobs:
 
       - name: Run finder
         env:
-          # GITHUB_TOKEN is automatically provided by Actions — no setup needed.
-          # RESEND_API_KEY and TO_EMAIL must be added as repository secrets.
-          # Go to: Settings → Secrets and variables → Actions → New repository secret
-          GITHUB_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+          # GH_PAT: a personal access token with NO scopes (public data needs none).
+          GITHUB_TOKEN:   ${{ secrets.GH_PAT }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           TO_EMAIL:       ${{ secrets.TO_EMAIL }}
         run: python finder.py
