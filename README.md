@@ -55,10 +55,43 @@ The cron fires every Thursday at 4pm UTC (10pm BDT). That's it.
 
 ### Change languages
 
-Edit the `LANGUAGES` list in `finder.py`:
+Edit the `languages` section in `skills.yaml`. Set `search: true`/`false` to
+include or exclude a language, `level` to record your comfort, and an
+optional `weight` (relative to `1.0` = neutral) to nudge scoring:
 
-```python
-LANGUAGES = ["python", "javascript", "typescript", "java"]
+```yaml
+languages:
+  python:
+    level: advanced
+    search: true
+    weight: 1.2
+  typescript:
+    level: beginner
+    search: false
+```
+
+If `skills.yaml` is missing, malformed, or every language is disabled,
+`finder.py` falls back to `["python", "javascript"]` and prints a warning —
+the scheduled run never crashes because of a config problem.
+
+### Keyword and preference scoring
+
+`skills.yaml` also supports soft scoring modifiers — matches never exclude
+an issue, they only nudge its rank:
+
+```yaml
+keywords:
+  positive:   # small score bonus if title/body mentions these
+    - cli
+    - api
+  negative:   # moderate score penalty if title/body mentions these
+    - blockchain
+
+preferences:
+  avoid_docs_only: true   # deprioritize quick docs/readme/typo-only issues
+                           # (conservative — skips the penalty if the issue
+                           # also has a bug/enhancement label, or mentions
+                           # technical work like CLI/API/tests/migration)
 ```
 
 ### Adjust quality thresholds
@@ -69,10 +102,11 @@ MAX_COMMENTS = 15    # Issues with more comments are deprioritized
 TOP_N        = 8     # Number of issues in each digest
 ```
 
-### Update your skill profile
+### Dependencies
 
-Edit `skills.yaml` — this will drive the Phase 2 skill matcher
-that further personalises which issues surface.
+Dependencies are listed in `requirements.txt` (`requests` + `PyYAML`) and
+installed via `pip install -r requirements.txt` in the GitHub Actions
+workflow.
 
 ---
 
@@ -81,7 +115,8 @@ that further personalises which issues surface.
 ```
 .
 ├── finder.py                     # Main script
-├── skills.yaml                   # Your skill profile (Phase 2 input)
+├── skills.yaml                   # Your skill profile (languages, keywords, preferences)
+├── requirements.txt              # Python dependencies
 └── .github/
     └── workflows/
         └── schedule.yml          # Cron trigger + Actions config
@@ -89,6 +124,7 @@ that further personalises which issues surface.
 
 ## Roadmap
 
-- **Phase 1** (current) — Language-filtered search + complexity scoring + email digest
-- **Phase 2** — Skill matcher reads `skills.yaml`, weights by domain and comfort level
+- **Phase 1** — Language-filtered search + complexity scoring + email digest
+- **Phase 2** (current) — Skill matcher reads `skills.yaml`: language selection/weighting,
+  positive/negative keyword scoring, comment-count rebalancing, docs-only deprioritization
 - **Phase 3** — Track which issues you actually worked on, learn from outcomes

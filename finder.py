@@ -7,8 +7,10 @@ scores them by complexity, and emails a digest via Resend.
 
 import os
 import random
+import re
 import time
 import requests
+import yaml
 from datetime import datetime, timezone, timedelta
 
 # ─── Config ──────────────────────────────────────────────────────────────────
@@ -17,8 +19,145 @@ GITHUB_TOKEN  = os.environ["GITHUB_TOKEN"]
 RESEND_API_KEY = os.environ["RESEND_API_KEY"]
 TO_EMAIL      = os.environ["TO_EMAIL"]
 
-# Your languages — update this list as your skills evolve
-LANGUAGES = ["python", "javascript"]
+# Fallback used if skills.yaml is missing, malformed, or disables every
+# language — the scheduled run must never crash because of a config problem.
+DEFAULT_LANGUAGES = ["python", "javascript"]
+
+
+VALID_LEVELS = ("beginner", "intermediate", "advanced")
+
+
+def _invalid(path: str, reason: str) -> dict:
+    print(f"  ⚠ skills.yaml: {reason}, falling back to {DEFAULT_LANGUAGES}", flush=True)
+    return {
+        "languages": DEFAULT_LANGUAGES,
+        "language_weights": {},
+        "language_levels": {},
+        "keywords_positive": [],
+        "keywords_negative": [],
+        "avoid_docs_only": False,
+    }
+
+
+def _is_str_list(value) -> bool:
+    return isinstance(value, list) and all(isinstance(v, str) for v in value)
+
+
+def load_skills(path: str = "skills.yaml") -> dict:
+    """
+    Load language selection + scoring preferences from skills.yaml.
+
+    Returns a dict with:
+      languages:         list of language keys to search
+      language_weights:  {lang: weight}, default 1.0 (neutral)
+      language_levels:   {lang: level}, default "intermediate"
+      keywords_positive: list of str, default []
+      keywords_negative: list of str, default []
+      avoid_docs_only:   bool, default False
+
+    Falls back to DEFAULT_LANGUAGES with neutral/empty everything else on
+    any parse error, missing file, invalid field type/shape, or empty
+    language list. The scheduled run must never crash because of a config
+    mistake — invalid shapes are rejected, not coerced.
+    """
+    try:
+        with open(path, "r") as f:
+            raw = yaml.safe_load(f)
+    except Exception as e:
+        return _invalid(path, f"failed to read/parse file ({e})")
+
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        return _invalid(path, "root config must be a mapping")
+
+    languages_cfg = raw.get("languages")
+    if languages_cfg is None:
+        languages_cfg = {}
+    if not isinstance(languages_cfg, dict):
+        return _invalid(path, "'languages' must be a mapping")
+
+    languages, weights, levels = [], {}, {}
+    for lang, cfg in languages_cfg.items():
+        if cfg is None:
+            cfg = {}
+        if not isinstance(cfg, dict):
+            return _invalid(path, f"languages.{lang} must be a mapping")
+
+        if "search" in cfg:
+            if not isinstance(cfg["search"], bool):
+                return _invalid(path, f"languages.{lang}.search must be a boolean")
+            search = cfg["search"]
+        else:
+            search = True
+        if search:
+            languages.append(lang)
+
+        if "weight" in cfg:
+            weight = cfg["weight"]
+            if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+                return _invalid(path, f"languages.{lang}.weight must be a number")
+            weights[lang] = float(weight)
+
+        if "level" in cfg:
+            if cfg["level"] not in VALID_LEVELS:
+                return _invalid(
+                    path, f"languages.{lang}.level must be one of {VALID_LEVELS}"
+                )
+            levels[lang] = cfg["level"]
+        else:
+            levels[lang] = "intermediate"
+
+    if not languages:
+        return _invalid(path, "no languages enabled for search")
+
+    keywords_cfg = raw.get("keywords")
+    if keywords_cfg is None:
+        keywords_cfg = {}
+    if not isinstance(keywords_cfg, dict):
+        return _invalid(path, "'keywords' must be a mapping")
+
+    positive = keywords_cfg.get("positive")
+    if positive is None:
+        positive = []
+    elif not _is_str_list(positive):
+        return _invalid(path, "keywords.positive must be a list of strings")
+
+    negative = keywords_cfg.get("negative")
+    if negative is None:
+        negative = []
+    elif not _is_str_list(negative):
+        return _invalid(path, "keywords.negative must be a list of strings")
+
+    preferences_cfg = raw.get("preferences")
+    if preferences_cfg is None:
+        preferences_cfg = {}
+    if not isinstance(preferences_cfg, dict):
+        return _invalid(path, "'preferences' must be a mapping")
+
+    avoid_docs_only = preferences_cfg.get("avoid_docs_only", False)
+    if not isinstance(avoid_docs_only, bool):
+        return _invalid(path, "preferences.avoid_docs_only must be a boolean")
+
+    return {
+        "languages": languages,
+        "language_weights": weights,
+        "language_levels": levels,
+        "keywords_positive": positive,
+        "keywords_negative": negative,
+        "avoid_docs_only": avoid_docs_only,
+    }
+
+
+_skills = load_skills()
+
+# Your languages — driven by skills.yaml (languages.<lang>.search)
+LANGUAGES         = _skills["languages"]
+LANGUAGE_WEIGHTS  = _skills["language_weights"]
+LANGUAGE_LEVELS   = _skills["language_levels"]
+KEYWORDS_POSITIVE = [k.lower() for k in _skills["keywords_positive"]]
+KEYWORDS_NEGATIVE = [k.lower() for k in _skills["keywords_negative"]]
+AVOID_DOCS_ONLY   = _skills["avoid_docs_only"]
 
 # Label tiers — used for SCORING only (tier inference from returned issue labels)
 #
@@ -149,6 +288,25 @@ def get_repo(full_name: str, cache: dict) -> dict:
 
 # ─── Scoring ─────────────────────────────────────────────────────────────────
 
+_KEYWORD_PATTERN_CACHE: dict = {}
+
+
+def contains_keyword(text: str, keyword: str) -> bool:
+    """
+    Boundary-safe keyword/phrase match — avoids false positives from plain
+    substring matching (e.g. "cli" matching "client", "api" matching
+    "capitalization", "test" matching "latest", "ios" matching "scenarios").
+
+    Single-word keywords match on word boundaries (\\b). Multi-word phrases
+    match on phrase boundaries the same way, since \\b already anchors at
+    both ends of the phrase.
+    """
+    pattern = _KEYWORD_PATTERN_CACHE.get(keyword)
+    if pattern is None:
+        pattern = re.compile(r"\b" + re.escape(keyword) + r"\b")
+        _KEYWORD_PATTERN_CACHE[keyword] = pattern
+    return pattern.search(text) is not None
+
 def score_body_quality(body: str) -> int:
     """
     Lightweight NLP signal — no external libraries, pure keyword matching.
@@ -188,7 +346,20 @@ def score_body_quality(body: str) -> int:
     return min(score, 20)  # cap at 20
 
 
-def score_issue(issue: dict, repo: dict, label_tier: str) -> int:
+# Doc-related signal words in a title/label — used only for the conservative
+# avoid_docs_only preference below.
+DOC_KEYWORDS = ("docs", "documentation", "readme", "typo")
+
+# Technical signal words that exempt an issue from the docs-only penalty even
+# if it also mentions docs/readme — e.g. "update API docs with migration
+# example and add tests" is real work, not a quick typo fix.
+TECHNICAL_SIGNAL_KEYWORDS = (
+    "api", "cli", "command line", "migration", "example", "reproducible",
+    "steps to reproduce", "validation", "test", "tests", "workflow",
+)
+
+
+def score_issue(issue: dict, repo: dict, label_tier: str, language: str) -> int:
     """
     Score an issue from 0–100 based on complexity + repo health signals.
     Higher = better fit for a 4–8 hour weekend session.
@@ -196,11 +367,14 @@ def score_issue(issue: dict, repo: dict, label_tier: str) -> int:
     Signals used:
       - label_tier:    "beginner" → +15 bonus, "general" → -10 penalty
       - Body quality:  keyword-based actionability score (+0 to +20)
-      - Comment count: 2–8 is ideal (some context, not a rabbit hole)
+      - Comment count: 0 is a strong positive (unowned), rising counts taper off
       - Body length:   200–1500 chars (clear enough, not overwhelming)
       - Stars:         signals an active, maintained repo
       - Assignee:      confirmed absent by query, double-checked here
       - Type labels:   bug/enhancement add clarity
+      - Language:      skills.yaml weight + comfort level (small nudges)
+      - Keywords:      skills.yaml keywords.positive/negative (soft nudges)
+      - Docs-only:     conservative penalty, see avoid_docs_only below
     """
     score = 0
 
@@ -209,6 +383,7 @@ def score_issue(issue: dict, repo: dict, label_tier: str) -> int:
     body_len    = len(body)
     stars       = repo.get("stargazers_count", 0)
     label_names = [l["name"].lower() for l in issue.get("labels", [])]
+    title       = issue.get("title", "")
 
     # ── Label tier ───────────────────────────────────────────────────────────
     # Labels are now a scoring modifier, not a hard gate.
@@ -221,13 +396,17 @@ def score_issue(issue: dict, repo: dict, label_tier: str) -> int:
     score += score_body_quality(body)
 
     # ── Comment count ─────────────────────────────────────────────────────────
-    # Weight reduced vs before — labels + body quality are now better signals.
-    if 2 <= comments <= 8:
-        score += 20
-    elif comments < 2:
-        score += 8    # newly filed — low context but not disqualifying
+    # 0 comments is a strong positive signal — usually means no assignment
+    # ownership yet. Score tapers off as comment count (and likely
+    # contention/complexity) rises.
+    if comments == 0:
+        score += 18   # unowned, no assignment risk
+    elif comments <= 2:
+        score += 15   # still acceptable
+    elif comments <= 5:
+        score += 5    # mixed
     elif comments <= MAX_COMMENTS:
-        score += 5
+        score -= 5    # increasingly deprioritized
     else:
         score -= 15   # heavily debated = likely underspecified
 
@@ -258,6 +437,38 @@ def score_issue(issue: dict, repo: dict, label_tier: str) -> int:
     # ── Type label context ────────────────────────────────────────────────────
     if "bug" in label_names or "enhancement" in label_names:
         score += 5
+
+    # ── Language weight + comfort level (skills.yaml) ─────────────────────────
+    # weight is relative to 1.0 = neutral, so it nudges rather than dominates.
+    score += round((LANGUAGE_WEIGHTS.get(language, 1.0) - 1.0) * 10)
+    score += {"advanced": 4, "intermediate": 2, "beginner": 0}.get(
+        LANGUAGE_LEVELS.get(language, "intermediate"), 0
+    )
+
+    # ── Keyword scoring (skills.yaml keywords.positive/negative) ─────────────
+    # Soft ranking modifiers only — matches never exclude an issue.
+    text = f"{title} {body}".lower()
+    if any(contains_keyword(text, kw) for kw in KEYWORDS_POSITIVE):
+        score += 8
+    if any(contains_keyword(text, kw) for kw in KEYWORDS_NEGATIVE):
+        score -= 12
+
+    # ── Docs-only preference (skills.yaml preferences.avoid_docs_only) ───────
+    # Conservative: only penalizes when there's no code-signal label AND no
+    # technical workflow signal (CLI/API/example/migration/test/validation/
+    # reproduce/workflow) alongside the docs-related signal. Never excludes.
+    if AVOID_DOCS_ONLY:
+        title_lower = title.lower()
+        has_code_signal_label = "bug" in label_names or "enhancement" in label_names
+        looks_doc_related = (
+            any(l in ("documentation", "docs") for l in label_names)
+            or any(contains_keyword(title_lower, kw) for kw in DOC_KEYWORDS)
+        )
+        has_technical_signal = any(
+            contains_keyword(text, kw) for kw in TECHNICAL_SIGNAL_KEYWORDS
+        )
+        if looks_doc_related and not has_code_signal_label and not has_technical_signal:
+            score -= 20   # soft demotion only — never excluded from the digest
 
     return score
 
@@ -340,7 +551,7 @@ def collect_issues() -> list[dict]:
             issue_label_set = {l["name"].lower() for l in issue.get("labels", [])}
             tier = "beginner" if issue_label_set & BEGINNER_LABELS_SET else "general"
 
-            s = score_issue(issue, repo, tier)
+            s = score_issue(issue, repo, tier, lang)
             candidates.append({
                 "score":        s,
                 "label_tier":   tier,

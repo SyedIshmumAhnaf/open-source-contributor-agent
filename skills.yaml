@@ -2,39 +2,64 @@
 # ─────────────────────────────────────────────────────
 # Your personal knowledge base for the OSS Issue Finder.
 #
-# This file is the foundation for Phase 2 — once the
-# skill matcher is built, finder.py will read this file
-# and use it to weight issues toward your actual stack.
+# Phase 2: finder.py reads this file to decide which
+# languages to search and how to weight/score results.
 #
 # Comfort levels: beginner | intermediate | advanced
 # ─────────────────────────────────────────────────────
 
 languages:
-  python:     advanced
-  java:       intermediate
-  javascript: intermediate
-  typescript: beginner
+  python:
+    level: advanced
+    search: true
+    weight: 1.2        # optional; omit for neutral (1.0). Typical range 0.5-2.0
+  java:
+    level: intermediate
+    search: true
+  javascript:
+    level: intermediate
+    search: true
+  typescript:
+    level: beginner
+    search: false       # set false to exclude from search without deleting the entry
 
 frameworks:
-  flask:    intermediate
+  flask: intermediate
 
 databases:
   postgresql: beginner
-  mysql:      intermediate
-  sqlite:     beginner
+  mysql: intermediate
+  sqlite: beginner
 
-domains:
-  - scripting
-  - automation
-  - web-backend
-  - cli-tools
-  - testing
+# Keywords matched with word/phrase-boundary matching against issue title + body.
+# These are literal text signals, not a semantic understanding of "domains".
+keywords:
+  positive:
+    - automation
+    - cli
+    - command line
+    - testing
+    - test
+    - api
+    - backend
+    - data
+    - python
+    - javascript
+    - schema
+    - validation
+  negative:
+    - embedded
+    - mobile
+    - android
+    - ios
+    - blockchain
+    - crypto
+    - kubernetes
 
-avoid:
-  # Domains to deprioritize — finder will score these lower in Phase 2
-  - embedded-systems
-  - mobile
-  - devops-infrastructure
+preferences:
+  # Deprioritize (never exclude) issues that look like quick docs/readme/typo
+  # fixes with no code-signal labels or technical workflow signals.
+  avoid_docs_only: true
 
 # Target effort range (hours) for a single weekend session
 target_hours:
